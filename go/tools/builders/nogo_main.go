@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pmezard/go-difflib/difflib"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/gcexportdata"
 	"golang.org/x/tools/internal/facts"
@@ -545,8 +546,68 @@ func checkAnalysisResults(actions []*action, pkg *goPackage) string {
 		errMsg.WriteString(sep)
 		sep = "\n"
 		fmt.Fprintf(errMsg, "%s: %s (%s)", pkg.fset.Position(d.Pos), d.Message, d.Name)
+		for _, fix := range d.SuggestedFixes {
+			diff, err := calculateDiff(pkg.fset.File(d.Pos), fix.TextEdits)
+			if err != nil {
+				fmt.Fprintf(errMsg, "\nerror calculating diff: %v", err)
+				continue
+			}
+			println(diff)
+		}
 	}
 	return errMsg.String()
+}
+
+func calculateDiff(f *token.File, edits []analysis.TextEdit) (string, error) {
+	sort.SliceStable(edits, func(i, j int) bool {
+		return edits[i].Pos < edits[j].Pos || edits[i].End < edits[j].End
+		// Some edits are purely insertion. They should be prioritised.
+	})
+
+	beforeBytes, err := os.ReadFile(f.Name())
+	if err != nil {
+		return "", err
+	}
+	before := string(beforeBytes)
+
+	after := applyEdits(f, edits, before)
+	// The epoch timestamp is assumed to represent file creation/deletion events
+	// by some tools, so use a dummy timestamp that is one ns past the epoch.
+	// See https://github.com/bazelbuild/bazel-gazelle/issues/1528.
+	date := "1970-01-01 00:00:00.000000001 +0000"
+	diff := difflib.UnifiedDiff{
+		Context:  3,
+		FromDate: date,
+		ToDate:   date,
+		FromFile: f.Name(),
+		ToFile:   f.Name(),
+		A: 	      difflib.SplitLines(before),
+		B: 	      difflib.SplitLines(after),
+	}
+
+	return difflib.GetUnifiedDiffString(diff)
+}
+
+func applyEdits(f *token.File, edits []analysis.TextEdit, before string) string {
+	var b strings.Builder
+	var currentOffset int
+	for _, edit := range edits {
+		off := f.Offset(edit.Pos)
+		b.WriteString(before[currentOffset:off])
+		if len(edit.NewText) > 0 {
+			b.Write(edit.NewText)
+		}
+
+		end := off
+		if edit.End.IsValid() {
+			// The end pos for text edits may be token.NoPos to represent pure
+			// insertion.
+			end = f.Offset(edit.End)
+		}
+		currentOffset = end
+	}
+	b.WriteString(before[currentOffset:])
+	return b.String()
 }
 
 // config determines which source files an analyzer will emit diagnostics for.
@@ -578,7 +639,7 @@ type importer struct {
 	factMap      map[string]string         // map import path in source code to file containing serialized facts
 }
 
-func newImporter(importMap, packageFile map[string]string, factMap map[string]string) *importer {
+func newImporter(importMap, packageFile, factMap map[string]string) *importer {
 	return &importer{
 		fset:         token.NewFileSet(),
 		importMap:    importMap,

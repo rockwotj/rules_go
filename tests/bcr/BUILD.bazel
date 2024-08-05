@@ -12,6 +12,7 @@ nogo(
     name = "my_nogo",
     visibility = ["//visibility:public"],
     deps = TOOLS_NOGO,
+    debug = True,
 )
 
 go_library(
